@@ -154,9 +154,6 @@ def get_quantize_node_info(activation_post_process: Callable) -> Optional[Tuple[
     of extracted qparams from the module
     '''
     dtype = activation_post_process.dtype  # type: ignore[attr-defined]
-    print(activation_post_process)
-    print(activation_post_process.dtype)
-    input()
     compute_dtype = None
     if hasattr(activation_post_process, "compute_dtype"):
         compute_dtype = activation_post_process.compute_dtype  # type: ignore[attr-defined]
