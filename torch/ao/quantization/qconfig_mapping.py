@@ -74,6 +74,8 @@ def _get_default_qconfig_mapping(is_qat: bool, backend: str, version: int) -> QC
     else:
         qconfig_transpose = qconfig
 
+    # currently layernorm only supports float weights
+    # we have to add this because otherwise there will be a extra quantize-dequantize pair
     qconfig_layernorm = QConfig(activation=qconfig.activation, weight=default_placeholder_observer)
 
     qconfig_mapping = QConfigMapping() \
