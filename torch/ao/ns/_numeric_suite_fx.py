@@ -112,6 +112,7 @@ from .fx.utils import (
     rekey_logger_info_on_node_name_of_model,
     maybe_add_missing_fqns,
     get_target_type_str,
+    get_normalized_nth_input,
 )
 
 from .fx.ns_types import (
@@ -120,7 +121,29 @@ from .fx.ns_types import (
     NSNodeTargetType,
 )
 
-from typing import Dict, Tuple, Callable, List, Optional, Set
+from torch.ao.quantization import (
+    QConfigMapping,
+)
+from torch.ao.quantization.fx.custom_config import PrepareCustomConfig
+from torch.ao.quantization.backend_config.utils import get_fusion_pattern_to_root_node_getter
+from torch.ao.quantization.fx.backend_config_utils import get_pattern_to_quantize_handlers
+from torch.ao.quantization.fx.match_utils import find_matches
+from torch.ao.quantization.fx.qconfig_mapping_utils import generate_qconfig_map
+from torch.ao.ns.fx.n_shadows_utils import (
+    OutputProp,
+    _get_attr_name,
+    _get_attr_wrapper_name,
+    _get_dedup_subgraphs,
+    _get_logger_for_subgraph,
+    _add_logger_to_subgraph_wrapper,
+    SHADOW_WRAPPER_NODE_NAME_PREFIX,
+    create_submodule_from_subgraph,
+    group_results_by_subgraph,
+    create_results_comparison,
+    print_n_shadows_summary,
+)
+
+from typing import Dict, Tuple, Callable, List, Optional, Set, Any, Type
 
 RNNReturnType = Tuple[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]
 
@@ -146,6 +169,7 @@ class OutputLogger(nn.Module):
         index_within_arg: int,
         index_of_arg: int,
         fqn: Optional[str],
+        qconfig_str: Optional[str] = '',
     ):
         super().__init__()
         self.stats: List[torch.Tensor] = []
@@ -189,12 +213,24 @@ class OutputLogger(nn.Module):
         self.index_of_arg = index_of_arg
         # fully qualified name
         self.fqn = fqn
+        # if loggers are added before prepare_fx, but we do not want
+        # collect results of calibration, only results after convert_fx
+        # so, we add a flag to control whether this logger collects data
+        self.enabled = True
+        # string representation of qconfig
+        self.qconfig_str = qconfig_str
+        # this can be turned off to reduce memory usage during calibration
+        self.save_activations = True
 
     # Note: cannot annotate the type of x because TorchScript does not support
     #   the Union type.
     def forward(self, x):
         """
         """  # blank docblock to make autodoc happy
+        if not self.enabled:
+            return x
+        if not self.save_activations:
+            return x
         if isinstance(x, torch.Tensor):
             self.stats.append(x.detach())
         elif isinstance(x, tuple) and len(x) == 2 and len(x[1]) == 2:
@@ -208,6 +244,36 @@ prev_node_name={self.prev_node_name}, ref_node_name={self.ref_node_name},
 ref_node_target_type={self.ref_node_target_type}
 results_type={self.results_type}, index_within_arg={self.index_within_arg},
 index_of_arg={self.index_of_arg}, fqn={self.fqn})"""
+
+
+class OutputComparisonLogger(OutputLogger):
+    """
+    Same as OutputLogger, but also requires the original activation
+    in order to calculate the comparison at calibration time
+    """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # TODO(future PR): make the comparison function configurable
+        self.comparison_fn = torch.ao.ns.fx.utils.compute_sqnr
+        self.comparison_fn_name = 'sqnr'
+        # precalculated comparisons of logger output versus reference
+        self.comparisons = []
+        # precalculated comparisons function
+
+    def forward(self, x, x_ref):
+        if not self.enabled:
+            return x
+        assert isinstance(x, torch.Tensor), 'non-tensor inputs not yet supported'
+        if self.save_activations:
+            # save the activation, for debugging
+            self.stats.append(x.detach())
+        # save the comparison
+        self.comparisons.append(self.comparison_fn(x, x_ref))
+        return x
+
+    def __repr__(self):
+        return "OutputComparisonLogger"
 
 
 class NSTracer(quantize_fx.QuantizationTracer):
@@ -473,7 +539,7 @@ def _extract_logger_info_one_model(
             stats_to_use = mod.stats
             if len(mod.stats_rnn) > 0:
                 stats_to_use = mod.stats_rnn
-            results[key][mod.results_type][mod.model_name].append({
+            data = {
                 'type': mod.results_type,
                 'values': stats_to_use,
                 'ref_node_name': mod.ref_node_name,
@@ -483,7 +549,15 @@ def _extract_logger_info_one_model(
                 'index_within_arg': mod.index_within_arg,
                 'index_of_arg': mod.index_of_arg,
                 'fqn': mod.fqn,
-            })
+                'qconfig_str': mod.qconfig_str,
+            }
+            if hasattr(mod, 'comparisons'):
+                data['comparisons'] = mod.comparisons
+                data['comparison_fn_name'] = mod.comparison_fn_name
+            else:
+                data['comparisons'] = []
+                data['comparison_fn_name'] = ''
+            results[key][mod.results_type][mod.model_name].append(data)
             # ensure the list stays sorted
             results[key][mod.results_type][mod.model_name].sort(
                 key=lambda res:
@@ -673,3 +747,246 @@ def extend_logger_results_with_comparison(
                 for value_1, value_2 in zip(values_1, values_2):
                     comparison_result = comparison_fn(value_1, value_2)
                     result_2[comparison_name].append(comparison_result)
+
+def prepare_n_shadows_model(
+    model: torch.nn.Module,
+    example_inputs: Any,
+    qconfig_mappings: List[QConfigMapping],
+    backend_config_dict: Any,
+) -> torch.nn.Module:
+    """
+    Given a model with a graph such as
+
+      x0 -> op0 -> x1 -> op1 -> x2
+
+    and two qconfigs for op0 and two qconfigs for op1, creates a model with a
+    graph such as
+
+      x0 -> op0 -----> log_0_0 -> x1 -> op1 -----> log_1_0 -> x2
+       |                           |
+       | -> op0_q_0 -> log_0_1     | -> op1_q_0 -> log_1_1
+       |                           |
+       | -> op0_q_1 -> log_0_1     | -> op1_q_1 -> log_1_2
+
+    where op0 is the original op0, op0_q_0 is op0 quantized with qconfig_0_0,
+    op0_q_1 is op0 quantized_with qconfig_0_1, and log_0_0 is a logger recording
+    the values flowing through the output of op0..
+
+    This is useful for testing different quantization of multiple layers in
+    a single pass through the model.
+
+    High level TODOs for future PRs:
+    1. add deduplication for qconfigs per subgraph
+    2. figure out a better way to name the output structure
+    3. for now, results are manually printed in an easy to read way. A logical
+       next step would be to automaticaly output the best qconfig, and then
+       automatically output a single model quantized with that best qconfig.
+    """
+
+    # We need to set the loggers as non traceable to have them survive
+    # prepare_fx and convert_fx calls.
+    prepare_custom_config = PrepareCustomConfig()\
+        .set_non_traceable_module_classes([OutputLogger, OutputComparisonLogger])
+
+    tracer = quantize_fx.QuantizationTracer([], [])
+    mt = torch.fx.GraphModule(model, tracer.trace(model))
+
+    # run example input propagation, we need this to call prepare_fx on
+    # individual subgraphs
+    output_prop = OutputProp(mt)
+    output_prop.propagate(*example_inputs)
+
+    # Find the set of subgraphs in the original graph which we need to
+    # consider.
+    modules = dict(mt.named_modules(remove_duplicate=False))
+    patterns = get_pattern_to_quantize_handlers(backend_config_dict)
+    root_node_getter_mapping = \
+        get_fusion_pattern_to_root_node_getter(backend_config_dict)
+    standalone_module_names: List[str] = []
+    standalone_module_classes: List[Type] = []
+    custom_module_classes: List[Type] = []
+    matches = find_matches(
+        mt.graph, modules, patterns, root_node_getter_mapping,
+        standalone_module_names, standalone_module_classes, custom_module_classes)
+    subgraphs_dedup = _get_dedup_subgraphs(matches)
+
+    # generate node to qconfig for each subgraph
+    # TODO(future PR): deduplicate repeating entries
+    list_of_node_name_to_qconfig = []
+    for qconfig_mapping in qconfig_mappings:
+        node_name_to_qconfig = generate_qconfig_map(
+            mt, modules, mt.graph, qconfig_mapping, tracer.node_name_to_scope)
+        list_of_node_name_to_qconfig.append(node_name_to_qconfig)
+
+    # Iterate through each quantization region in the model
+    for (subgraph_idx, (match_name, nodes_in_this_subgraph)) in \
+            enumerate(subgraphs_dedup.items()):
+        # for now, assume that
+        # 1. the first node has one input
+        # 2. the last node has one output
+        # 3. all the nodes are modules
+
+        # for now, ignore all subgraphs that contain non-nodes (tuples, etc)
+        # TODO(future PR): implement this
+        if any(
+            not isinstance(node, Node)
+            for node in nodes_in_this_subgraph
+        ):
+            continue
+
+        first_node = nodes_in_this_subgraph[0]
+        last_node = nodes_in_this_subgraph[-1]
+        # We used output propagation to populate example values on each
+        # node. Use the example values from the previous node as the input
+        # to the current node.
+        prev_node = get_normalized_nth_input(first_node, mt, 0)
+        if isinstance(prev_node, list):
+            example_inputs = [x.traced_result for x in prev_node]
+        elif isinstance(prev_node, tuple):
+            example_inputs = (x.traced_result for x in prev_node)
+        else:
+            # currently some ads models do not have a traced_result in every node,
+            # so we have to guard for this case since we cannot quantize without
+            # an example input
+            # TODO(future PR): add a test case for this once we have an easy repro
+            if hasattr(prev_node, 'traced_result'):
+                example_inputs = (prev_node.traced_result,)  # type: ignore[attr-defined]
+            else:
+                print(
+                    'unable to get example input for node ' +
+                    f'{first_node.format_node()}, skipping')
+                continue
+
+        # If there are no quantization configs for this subgraph, skip adding
+        # loggers. This reduces memory usage for models where not all layers are
+        # quantized.
+        # TODO(future): consider making this configurable
+        found_at_least_one_qconfig = False
+        for subgraph_candidate_idx in range(len(qconfig_mappings)):
+            node_name_to_qconfig = \
+                list_of_node_name_to_qconfig[subgraph_candidate_idx - 1]
+            qconfig = node_name_to_qconfig[first_node.name]
+            if qconfig is not None:
+                found_at_least_one_qconfig = True
+                break
+        if not found_at_least_one_qconfig:
+            print('unable to find at least one qconfig for node ' +
+                  f'{first_node.format_node()}, skipping')
+            continue
+
+        for subgraph_candidate_idx in range(len(qconfig_mappings) + 1):
+
+            if subgraph_candidate_idx == 0:
+                # idx = 0 is the floating point (original) version of the subgraph
+                # We keep the subgraph as is, and add a logger at the end
+
+                qconfig_str = ''
+                logger_mod_orig = _get_logger_for_subgraph(
+                    mt, first_node, last_node, subgraph_idx, subgraph_candidate_idx,
+                    qconfig_str, OutputLogger)
+
+                attr_name = _get_attr_name(subgraph_idx, subgraph_candidate_idx)
+                assert not hasattr(mt, attr_name)
+                setattr(mt, attr_name, logger_mod_orig)
+                with mt.graph.inserting_after(last_node):
+                    new_node = mt.graph.call_module(attr_name, args=(last_node,), kwargs={})
+
+            else:
+                # idx > 0 means we have a candidate qconfig to try, so we need
+                # to make a copy of the subgraph, feed it with the right inputs,
+                # and add a logger at the end
+
+                # get the qconfig
+                # subtract one because the first candidate is the floating point
+                # version of the subgraph
+                node_name_to_qconfig = \
+                    list_of_node_name_to_qconfig[subgraph_candidate_idx - 1]
+                qconfig = node_name_to_qconfig[first_node.name]
+
+                # if no quantization is requested, skip
+                # TODO(future PR): deduplicate equivalent qconfigs that come from
+                #   different qconfig mapping objects
+                if qconfig is None:
+                    continue
+
+                qconfig_mapping = QConfigMapping().set_global(qconfig)
+
+                # create a copy of the submodule, wrapped in a separate module
+                orig_mod_copy_wrapped = create_submodule_from_subgraph(
+                    mt, first_node, last_node)
+
+                # add a logger to the end of this submodule
+                # get first and last nodes of the submodule
+                _add_logger_to_subgraph_wrapper(
+                    orig_mod_copy_wrapped, subgraph_idx, subgraph_candidate_idx,
+                    str(qconfig), OutputComparisonLogger, last_node)
+
+                # add a call to prepare_fx on the wrapper module
+                orig_mod_copy_wrapped = torch.ao.quantization.quantize_fx.prepare_fx(
+                    orig_mod_copy_wrapped, qconfig_mapping, example_inputs=example_inputs,
+                    prepare_custom_config=prepare_custom_config)
+
+                # attach the wrapper to the model
+                attr_name = _get_attr_wrapper_name(subgraph_idx, subgraph_candidate_idx)
+                assert not hasattr(mt, attr_name)
+                setattr(mt, attr_name, orig_mod_copy_wrapped)
+
+                # add a call to the wrapper module from the parent graph
+                with mt.graph.inserting_after(last_node):
+                    # TODO(future PR): handle fusion patterns where non-first nodes
+                    # need inputs
+
+                    # pass in all node args and kwargs
+
+                    # the first argument is always the reference output of the last
+                    # node of this subgraph
+                    new_args = [last_node]
+
+                    for arg in first_node.args:
+                        if isinstance(arg, Node):
+                            new_args.append(arg)
+                        elif isinstance(arg, (list, tuple)) and len(arg) and isinstance(arg[0], Node):
+                            for inner_arg in arg:
+                                if isinstance(inner_arg, Node):
+                                    new_args.append(inner_arg)
+
+                    new_kwargs = {}
+                    for name, old_kwarg in first_node.kwargs.items():
+                        if isinstance(old_kwarg, Node):
+                            new_kwargs[name] = old_kwarg
+                        elif isinstance(old_kwarg, (list, tuple)) and len(old_kwarg):
+                            for inner_old_kwarg in old_kwarg:
+                                new_args.append(inner_old_kwarg)
+
+                    new_args = tuple(new_args)  # type: ignore[assignment]
+
+                    new_node = mt.graph.call_module(
+                        attr_name, args=new_args, kwargs=new_kwargs)
+
+    mt.recompile()
+    return mt
+
+def convert_n_shadows_model(model: GraphModule, save_activations=True) -> GraphModule:
+    for node in model.graph.nodes:
+        if node.name.startswith(SHADOW_WRAPPER_NODE_NAME_PREFIX):
+            orig_mod = getattr(model, node.name)
+            converted_mod = torch.ao.quantization.quantize_fx.convert_fx(
+                orig_mod)
+            setattr(model, node.name, converted_mod)
+
+    for name, child in model.named_modules():
+        if isinstance(child, OutputLogger):
+            child.enabled = True
+            child.save_activations = save_activations
+
+    return model
+
+def extract_results_n_shadows_model(model: torch.nn.Module) -> NSResultsType:
+    results: NSResultsType = {}
+    _extract_logger_info_one_model(model, results, OutputLogger)
+    return results
+
+def print_comparisons_n_shadows_model(results: NSResultsType) -> None:
+    results_grouped = group_results_by_subgraph(results)
+    results_comparison = create_results_comparison(results_grouped)
+    print_n_shadows_summary(results_comparison)
