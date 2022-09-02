@@ -6,7 +6,7 @@ import itertools
 from torch.utils._python_dispatch import TorchDispatchMode
 from torch.utils._pytree import tree_map, tree_flatten, tree_unflatten
 from functools import partial
-from torch.utils._mode_utils import no_dispatch, all_same_mode, find_outermost_mode
+from torch.utils._mode_utils import no_dispatch, all_same_mode
 import torch.autograd.forward_ad as fwAD
 from torch.overrides import enable_reentrant_dispatch
 from typing import Callable
