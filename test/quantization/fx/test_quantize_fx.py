@@ -13,7 +13,6 @@ import torch.nn.intrinsic as nni
 import torch.nn.intrinsic.quantized as nniq
 import torch.nn.intrinsic.quantized.dynamic as nniqd
 import torch.multiprocessing as mp
-from torch.ao.quantization import is_activation_post_process, get_default_qconfig_mapping
 
 # graph mode quantization based on fx
 from torch.ao.quantization.quantize_fx import (
@@ -53,6 +52,7 @@ from torch.ao.quantization import (
     get_default_qat_qconfig,
     get_default_qconfig_mapping,
     get_default_qat_qconfig_mapping,
+    is_activation_post_process,
     fuse_modules,
     fuse_modules_qat,
     prepare,
